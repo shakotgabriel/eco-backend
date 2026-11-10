@@ -1,0 +1,74 @@
+# EcoBus API stack — separate containers so one crash doesn't kill the rest.
+# Use managed Postgres in production (set DATABASE_URL in .env).
+#
+#   docker compose up -d --build
+#   curl http://localhost:8000/healthz/
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      REDIS_CACHE_URL: redis://redis:6379/1
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             python manage.py collectstatic --noinput &&
+             gunicorn bebeto_backend.wsgi:application --bind 0.0.0.0:8000 --workers 3 --timeout 60"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  worker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      REDIS_CACHE_URL: redis://redis:6379/1
+    depends_on:
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    command: celery -A bebeto_backend worker -l INFO --concurrency=2
+
+  beat:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      REDIS_CACHE_URL: redis://redis:6379/1
+    depends_on:
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    # Exactly one beat instance in the whole environment.
+    command: >
+      celery -A bebeto_backend beat -l INFO
+      --scheduler django_celery_beat.schedulers:DatabaseScheduler
+
+# Website + admin stay OUT of this file — deploy them as separate apps
+# so frontend releases never restart the API/worker/beat.
